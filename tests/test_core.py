@@ -611,6 +611,8 @@ def test_epd_and_fiber_preserving_ode():
 def test_public_api_excludes_typo_alias():
     import symlie
 
+    assert symlie.__version__ == "0.1.0"
+    assert "__version__" in symlie.__all__
     assert "poisson_bracket" in symlie.__all__
     assert "possion_bracket" not in symlie.__all__
     assert not hasattr(symlie, "possion_bracket")

@@ -20,10 +20,13 @@ from symlie.core import (
     verify_generator,
 )
 
+__version__ = "0.1.0"
+
 __all__ = [
     "DeterminingSystem",
     "InfinitesimalGenerator",
     "InfinitesimalSolution",
+    "__version__",
     "adjoint_frechet_derivative",
     "determining_equations",
     "differential_substitute",
