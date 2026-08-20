@@ -63,16 +63,24 @@ $$
 
 ## Installation
 
-Using `uv` (recommended):
+### Directly from GitHub
+
+Using `pip`:
+```bash
+pip install git+https://github.com/zhilongwei/symlie.git
+```
+
+Using `uv`:
+```bash
+uv add git+https://github.com/zhilongwei/symlie.git
+```
+
+### From Source (Development)
+
 ```bash
 git clone https://github.com/zhilongwei/symlie.git
 cd symlie
 uv sync
-```
-
-Or using `pip`:
-```bash
-pip install -e .
 ```
 
 ---
