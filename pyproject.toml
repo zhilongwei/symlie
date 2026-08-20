@@ -1,0 +1,70 @@
+[project]
+name = "symlie"
+version = "0.1.0"
+description = "Symbolic Lie Symmetry Analysis on Jet Spaces with SymPy"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Zhilong Wei" }
+]
+keywords = [
+    "differential-equations",
+    "jet-space",
+    "lie-algebra",
+    "lie-symmetry",
+    "pde",
+    "symbolic-computation",
+    "sympy",
+    "variational-calculus",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "sympy>=1.14.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zhilongwei/symlie"
+Repository = "https://github.com/zhilongwei/symlie"
+"Bug Tracker" = "https://github.com/zhilongwei/symlie/issues"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
+]
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/symlie"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/symlie",
+  "examples",
+  "tests",
+  "README.md",
+  "LICENSE",
+  "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+
