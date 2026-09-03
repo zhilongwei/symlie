@@ -13,14 +13,22 @@ def _as_tuple(value):
     return (value,)
 
 
+def _is_unique(items) -> bool:
+    return len(items) == len(set(items))
+
+
+def _ensure_unique(items, label: str) -> None:
+    if not _is_unique(items):
+        raise ValueError(f"{label} must be unique.")
+
+
 def _normalize_independents(independent_variables: Sequence[sp.Symbol]):
     independents = _as_tuple(independent_variables)
     if not independents:
         raise ValueError("Independent variables cannot be empty.")
     if not all(isinstance(var, sp.Symbol) for var in independents):
         raise TypeError("Independent variables must be Sympy symbols.")
-    if len(independents) != len(set(independents)):
-        raise ValueError("Independent variables must be unique.")
+    _ensure_unique(independents, "Independent variables")
     return independents
 
 
@@ -48,8 +56,7 @@ def _normalize_dependents(
             raise TypeError("Dependent variable must be undefined Sympy functions.")
         dependents.append(applied)
 
-    if len(dependents) != len(set(dependents)):
-        raise ValueError("Dependent variables must be unique.")
+    _ensure_unique(dependents, "Dependent variables")
 
     return tuple(dependents)
 
@@ -188,6 +195,33 @@ def total_derivative(
     return sp.diff(sp.simplify(expression), independent_variable, order)
 
 
+def _jets_for_dependent(jets, dependent_index):
+    """Yield ``(multi_index, jet)`` pairs belonging to ``dependent_index``."""
+    return (
+        (multi_index, jet)
+        for (index, multi_index), jet in jets.items()
+        if index == dependent_index
+    )
+
+
+def _frechet_derivative_rows(expressions, dependents, independents, tests):
+    rows = []
+    for expr in expressions:
+        jets = _dependent_jets(expr, dependents, independents)
+        row = []
+        for dependent_index in range(len(dependents)):
+            component = sum(
+                sp.diff(expr, jet)
+                * _derivative_from_multi_index(
+                    tests[dependent_index], multi_index, independents
+                )
+                for multi_index, jet in _jets_for_dependent(jets, dependent_index)
+            )
+            row.append(sp.expand(component))
+        rows.append(row)
+    return rows
+
+
 def frechet_derivative(
     equations, dependent_variables, independent_variables, test_functions
 ):
@@ -196,22 +230,7 @@ def frechet_derivative(
     expressions = _normalize_equations(equations)
     tests = _normalize_expressions(test_functions, len(dependents), "Test functions")
 
-    rows = []
-    for expr in expressions:
-        jets = _dependent_jets(expr, dependents, independents)
-        row = []
-
-        for dependent_index, _ in enumerate(dependents):
-            component = sp.S.Zero
-            for (index, multi_index), jet in jets.items():
-                if index != dependent_index:
-                    continue
-                component += sp.diff(expr, jet) * _derivative_from_multi_index(
-                    tests[index], multi_index, independents
-                )
-            row.append(sp.expand(component))
-        rows.append(row)
-
+    rows = _frechet_derivative_rows(expressions, dependents, independents, tests)
     return sp.ImmutableDenseMatrix(rows)
 
 
@@ -228,16 +247,15 @@ def adjoint_frechet_derivative(
     )
 
     results = []
-    for dependent_index, _ in enumerate(dependents):
-        component = sp.S.Zero
-        for expr, test, jets in zip(expressions, tests, jets_by_expression):
-            for (index, multi_index), jet in jets.items():
-                if index != dependent_index:
-                    continue
-                term = _derivative_from_multi_index(
-                    sp.diff(expr, jet) * test, multi_index, independents
-                )
-                component += (-1) ** sum(multi_index) * term
+    for dependent_index in range(len(dependents)):
+        component = sum(
+            (-1) ** sum(multi_index)
+            * _derivative_from_multi_index(
+                sp.diff(expr, jet) * test, multi_index, independents
+            )
+            for expr, test, jets in zip(expressions, tests, jets_by_expression)
+            for multi_index, jet in _jets_for_dependent(jets, dependent_index)
+        )
         results.append(sp.expand(component))
 
     return tuple(results)
@@ -250,17 +268,14 @@ def euler_lagrange(density, dependent_variables, independent_variables):
     jets = _dependent_jets(density, dependents, independents)
 
     results = []
-    for dependent_index, _ in enumerate(dependents):
-        component = sp.S.Zero
-        for (index, multi_index), jet in jets.items():
-            if index != dependent_index:
-                continue
-
-            coefficient = sp.diff(density, jet)
-            component += (-1) ** sum(multi_index) * _derivative_from_multi_index(
-                coefficient, multi_index, independents
+    for dependent_index in range(len(dependents)):
+        component = sum(
+            (-1) ** sum(multi_index)
+            * _derivative_from_multi_index(
+                sp.diff(density, jet), multi_index, independents
             )
-
+            for multi_index, jet in _jets_for_dependent(jets, dependent_index)
+        )
         results.append(sp.expand(component))
 
     return tuple(results)
@@ -365,7 +380,7 @@ def _normalize_canonical_variables(coordinates, momenta, *, time=None):
         raise ValueError("Coordinates and momenta cannot be empty.")
     if len(coordinates) != len(momenta):
         raise ValueError("Coordinates and momenta must have the same length.")
-    if len(set(coordinates)) != len(coordinates) or len(set(momenta)) != len(momenta):
+    if not _is_unique(coordinates) or not _is_unique(momenta):
         raise ValueError("Coordinates and momenta must each be unique.")
     if set(coordinates) & set(momenta):
         raise ValueError("Coordinates and momenta must be distinct.")
@@ -396,12 +411,9 @@ def _normalize_canonical_variables(coordinates, momenta, *, time=None):
 def _ordered_derivative_candidates(expressions, dependents, independents):
     candidates = {}
     for expression in expressions:
-        for derivative in expression.atoms(sp.Derivative):
-            for dependent_index, dependent in enumerate(dependents):
-                multi_index = _multi_index(derivative, dependent, independents)
-                if multi_index is not None:
-                    candidates[derivative] = (dependent_index, multi_index)
-                    break
+        jets = _dependent_jets(expression, dependents, independents, include_zeros=False)
+        for (dependent_index, multi_index), derivative in jets.items():
+            candidates[derivative] = (dependent_index, multi_index)
 
     def candidate_key(item):
         derivative, (dependent_index, multi_index) = item
@@ -444,7 +456,9 @@ def _solve_substitution_system(expressions, leaders):
     if len(solutions) != 1 or any(leader not in solutions[0] for leader in leaders):
         return None
 
-    rules = {leader: sp.simplify(solutions[0][leader]) for leader in leaders}
+    # solve(..., simplify=True) already simplifies each solution; re-simplifying
+    # here would just repeat that work.
+    rules = {leader: solutions[0][leader] for leader in leaders}
     if any(right_hand_side.has(*leaders) for right_hand_side in rules.values()):
         return None
     if any(sp.simplify(expression.xreplace(rules)) != 0 for expression in expressions):
@@ -456,14 +470,71 @@ def _solve_substitution_system(expressions, leaders):
         if denominator != 1:
             _append_condition(conditions, denominator)
 
-    if len(expressions) == len(leaders):
-        jacobian = sp.Matrix(expressions).jacobian(leaders)
-        regularity_factor = sp.simplify(jacobian.det().xreplace(rules))
-        if regularity_factor == 0:
-            return None
-        _append_condition(conditions, regularity_factor)
+    # A regular, acyclic reduction requires the leaders to be locally isolated,
+    # regular roots of the (possibly overdetermined) system: the Jacobian
+    # restricted to the leader columns must have full column rank at the
+    # solution. Rank is witnessed by at least one non-vanishing square minor;
+    # search all len(leaders)-row combinations for one that is nonzero there.
+    jacobian = sp.Matrix(expressions).jacobian(leaders)
+    regular = False
+    for row_indices in combinations(range(len(expressions)), len(leaders)):
+        minor = jacobian[list(row_indices), :]
+        regularity_factor = sp.simplify(minor.det().xreplace(rules))
+        if regularity_factor != 0:
+            _append_condition(conditions, regularity_factor)
+            regular = True
+            break
+    if not regular:
+        return None
 
     return rules, tuple(conditions)
+
+
+def _infer_substitution_rules_core(
+    expressions, dependents, independents, *, leading_derivatives=None
+):
+    """Core of :func:`infer_substitution_rules`, assuming already-normalized inputs.
+
+    Always returns ``(rules, conditions)``.
+    """
+    candidates = _ordered_derivative_candidates(expressions, dependents, independents)
+
+    if leading_derivatives is not None:
+        leaders = _as_tuple(leading_derivatives)
+        if not leaders or not _is_unique(leaders):
+            raise ValueError("Leading derivatives must be non-empty and unique.")
+        if any(leader not in candidates for leader in leaders):
+            raise ValueError(
+                "Every leading derivative must occur in the equations as a derivative "
+                "of a dependent variable."
+            )
+        solved = _solve_substitution_system(expressions, leaders)
+        if solved is None:
+            raise ValueError(
+                "The equations do not define a unique regular, acyclic reduction "
+                "for the requested leading derivatives."
+            )
+        return solved
+
+    solved = None
+    maximum_leaders = min(len(expressions), len(candidates))
+    trial_count = 0
+    for leader_count in range(maximum_leaders, 0, -1):
+        for leaders in combinations(candidates, leader_count):
+            solved = _solve_substitution_system(expressions, leaders)
+            trial_count += 1
+            if solved is not None or trial_count >= 64:
+                break
+        if solved is not None or trial_count >= 64:
+            break
+    if solved is None and trial_count >= 64:
+        raise ValueError(
+            "Automatic leader selection exceeded its search limit; provide "
+            "leading_derivatives explicitly."
+        )
+    if solved is None:
+        solved = ({}, ())
+    return solved
 
 
 def infer_substitution_rules(
@@ -492,43 +563,9 @@ def infer_substitution_rules(
     independents = _normalize_independents(independent_variables)
     dependents = _normalize_dependents(dependent_variables, independent_variables)
     expressions = _normalize_equations(equations)
-    candidates = _ordered_derivative_candidates(expressions, dependents, independents)
-
-    if leading_derivatives is not None:
-        leaders = _as_tuple(leading_derivatives)
-        if not leaders or len(leaders) != len(set(leaders)):
-            raise ValueError("Leading derivatives must be non-empty and unique.")
-        if any(leader not in candidates for leader in leaders):
-            raise ValueError(
-                "Every leading derivative must occur in the equations as a derivative "
-                "of a dependent variable."
-            )
-        solved = _solve_substitution_system(expressions, leaders)
-        if solved is None:
-            raise ValueError(
-                "The equations do not define a unique regular, acyclic reduction "
-                "for the requested leading derivatives."
-            )
-    else:
-        solved = None
-        maximum_leaders = min(len(expressions), len(candidates))
-        trial_count = 0
-        for leader_count in range(maximum_leaders, 0, -1):
-            for leaders in combinations(candidates, leader_count):
-                solved = _solve_substitution_system(expressions, leaders)
-                trial_count += 1
-                if solved is not None or trial_count >= 64:
-                    break
-            if solved is not None or trial_count >= 64:
-                break
-        if solved is None and trial_count >= 64:
-            raise ValueError(
-                "Automatic leader selection exceeded its search limit; provide "
-                "leading_derivatives explicitly."
-            )
-        if solved is None:
-            solved = ({}, ())
-
+    solved = _infer_substitution_rules_core(
+        expressions, dependents, independents, leading_derivatives=leading_derivatives
+    )
     return solved if return_conditions else solved[0]
 
 
@@ -567,14 +604,29 @@ def differential_substitute(
         parsed_rules.append(
             (parsed[0], parsed[1], leading, sp.simplify(right_hand_side))
         )
-    parsed_rules.sort(key=lambda item: sum(item[1]), reverse=True)
+    # Break ties between equal-order rules by rule content (dependent index,
+    # multi-index, then a canonical Sympy sort key) rather than by the
+    # incidental iteration order of the input mapping, so the same rule set
+    # always resolves the same way regardless of dict insertion order.
+    parsed_rules.sort(
+        key=lambda item: (
+            -sum(item[1]),
+            item[0],
+            item[1],
+            sp.default_sort_key(item[2]),
+        )
+    )
 
     def find_replacements(current):
         replacements = {}
+        candidates = set(current.atoms(sp.Derivative))
+        candidates.update(dependent for dependent in dependents if current.has(dependent))
         derivatives = sorted(
-            current.atoms(sp.Derivative),
+            candidates,
             key=lambda item: (
-                -sum(count for _, count in item.variable_count),
+                -sum(count for _, count in item.variable_count)
+                if isinstance(item, sp.Derivative)
+                else 0,
                 sp.default_sort_key(item),
             ),
         )
@@ -655,10 +707,16 @@ def prolongation(
         )
         for dependent, phi_component in zip(dependents, phi)
     )
-    frechet = frechet_derivative(expressions, dependents, independents, characteristics)
+    # expressions/dependents/independents are already normalized above, so the
+    # *_core helpers are used directly here to avoid re-running _normalize_equations
+    # (and its sp.simplify pass) a second time inside frechet_derivative /
+    # infer_substitution_rules.
+    frechet_rows = _frechet_derivative_rows(
+        expressions, dependents, independents, characteristics
+    )
     residuals = []
     for row_index, expression in enumerate(expressions):
-        residual = sum(frechet[row_index, column] for column in range(len(dependents)))
+        residual = sum(frechet_rows[row_index])
         residual += sum(
             xi_component * sp.diff(expression, variable)
             for xi_component, variable in zip(xi, independents)
@@ -666,9 +724,9 @@ def prolongation(
         residuals.append(sp.expand(residual))
 
     if substitution_rules is None:
-        substitution_rules = infer_substitution_rules(
+        substitution_rules = _infer_substitution_rules_core(
             expressions, dependents, independents
-        )
+        )[0]
     if substitution_rules:
         residuals = [
             differential_substitute(
@@ -682,9 +740,11 @@ def prolongation(
     return tuple(sp.expand(residual) for residual in residuals)
 
 
-def _normalize_zero_expression(expression):
+def _normalize_zero_expression(expression, conditions=None):
     expression = sp.factor_terms(sp.cancel(sp.sympify(expression).doit()))
-    numerator, _ = sp.fraction(expression)
+    numerator, denominator = sp.fraction(expression)
+    if conditions is not None and denominator != 1:
+        _append_condition(conditions, denominator)
     _, primitive = sp.sympify(numerator).as_content_primitive()
     primitive = sp.factor_terms(primitive)
     if primitive.could_extract_minus_sign():
@@ -692,8 +752,8 @@ def _normalize_zero_expression(expression):
     return primitive
 
 
-def _append_unique(expressions, candidate):
-    candidate = _normalize_zero_expression(candidate)
+def _append_unique(expressions, candidate, conditions=None):
+    candidate = _normalize_zero_expression(candidate, conditions)
     if candidate == 0:
         return
     for existing in expressions:
@@ -707,25 +767,21 @@ def _jet_replacement_map(expression, dependents, independents):
     ordered_jets = sorted(jets.values(), key=sp.default_sort_key)
     jet_symbols = sp.symbols(f"J0:{len(ordered_jets)}")
     dependent_symbols = sp.symbols(f"U0:{len(dependents)}")
-    if len(dependents) == 1:
-        dependent_symbols = (
-            (dependent_symbols,)
-            if isinstance(dependent_symbols, sp.Symbol)
-            else dependent_symbols
-        )
     mapping = dict(zip(ordered_jets, jet_symbols))
     mapping.update(zip(dependents, dependent_symbols))
     return mapping, tuple(jet_symbols), tuple(dependent_symbols)
 
 
-def _split_on_jets(expression, dependents, independents):
+def _split_on_jets(expression, dependents, independents, conditions=None):
     mapping, jet_symbols, dependent_symbols = _jet_replacement_map(
         expression, dependents, independents
     )
     algebraic = sp.expand(expression.xreplace(mapping))
-    numerator = sp.together(algebraic).as_numer_denom()[0]
+    numerator, denominator = sp.together(algebraic).as_numer_denom()
+    if conditions is not None and denominator != 1:
+        _append_condition(conditions, denominator)
     if not jet_symbols:
-        return [_normalize_zero_expression(numerator)], dependent_symbols
+        return [_normalize_zero_expression(numerator, conditions)], dependent_symbols
     try:
         polynomial = sp.Poly(sp.expand(numerator), *jet_symbols)
     except sp.PolynomialError as error:
@@ -817,14 +873,12 @@ def determining_equations(
     phi = tuple(
         sp.Function(f"phi{index + 1}")(*arguments) for index in range(len(dependents))
     )
-    regularity_conditions = ()
+    conditions = []
     if substitution_rules is None:
-        substitution_rules, regularity_conditions = infer_substitution_rules(
-            expressions,
-            dependents,
-            independents,
-            return_conditions=True,
+        substitution_rules, inferred_conditions = _infer_substitution_rules_core(
+            expressions, dependents, independents
         )
+        conditions.extend(inferred_conditions)
     residuals = prolongation(
         expressions,
         dependents,
@@ -837,11 +891,11 @@ def determining_equations(
     dependent_symbols = tuple(sp.symbols(f"U0:{len(dependents)}"))
     for residual in residuals:
         split, current_dependent_symbols = _split_on_jets(
-            residual, dependents, independents
+            residual, dependents, independents, conditions
         )
         dependent_symbols = current_dependent_symbols
         for coefficient in split:
-            _append_unique(coefficients, coefficient)
+            _append_unique(coefficients, coefficient, conditions)
     return DeterminingSystem(
         equations=tuple(sp.Eq(coefficient, 0) for coefficient in coefficients),
         residuals=residuals,
@@ -849,7 +903,7 @@ def determining_equations(
         phi=phi,
         substitution_rules=dict(substitution_rules),
         dependent_symbols=dependent_symbols,
-        regularity_conditions=regularity_conditions,
+        regularity_conditions=tuple(conditions),
     )
 
 
@@ -902,14 +956,12 @@ def infinitesimals(
     independents = _normalize_independents(independent_variables)
     dependents = _normalize_dependents(dependent_variables, independent_variables)
     expressions = _normalize_equations(equations)
-    regularity_conditions = ()
+    conditions = []
     if substitution_rules is None:
-        substitution_rules, regularity_conditions = infer_substitution_rules(
-            expressions,
-            dependents,
-            independents,
-            return_conditions=True,
+        substitution_rules, inferred_conditions = _infer_substitution_rules_core(
+            expressions, dependents, independents
         )
+        conditions.extend(inferred_conditions)
 
     dependent_symbols = tuple(sp.symbols(f"U0:{len(dependents)}"))
     algebraic_variables = independents + dependent_symbols
@@ -919,8 +971,6 @@ def infinitesimals(
     component_count = len(independents) + len(dependents)
     for component_index in range(component_count):
         coefficients = sp.symbols(f"a{component_index + 1}_0:{len(monomials)}")
-        if len(monomials) == 1 and isinstance(coefficients, sp.Symbol):
-            coefficients = (coefficients,)
         coefficient_groups.append(tuple(coefficients))
         polynomial = sum(
             coefficient * monomial
@@ -946,7 +996,9 @@ def infinitesimals(
             residual, dependents, independents
         )
         algebraic = sp.expand(residual.xreplace(mapping))
-        numerator = sp.together(algebraic).as_numer_denom()[0]
+        numerator, denominator = sp.together(algebraic).as_numer_denom()
+        if denominator != 1:
+            _append_condition(conditions, denominator)
         generators = independents + current_dependent_symbols + jet_symbols
         try:
             polynomial = sp.Poly(sp.expand(numerator), *generators)
@@ -956,7 +1008,7 @@ def infinitesimals(
                 "invariance condition"
             ) from error
         for _, coefficient in polynomial.terms():
-            _append_unique(determining, coefficient)
+            _append_unique(determining, coefficient, conditions)
 
     all_coefficients = tuple(
         coefficient for group in coefficient_groups for coefficient in group
@@ -1011,7 +1063,7 @@ def infinitesimals(
         constants=constants,
         ansatz_degree=ansatz_degree,
         determining_equations=tuple(determining),
-        regularity_conditions=regularity_conditions,
+        regularity_conditions=tuple(conditions),
     )
 
 
