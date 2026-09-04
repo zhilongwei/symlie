@@ -411,7 +411,9 @@ def _normalize_canonical_variables(coordinates, momenta, *, time=None):
 def _ordered_derivative_candidates(expressions, dependents, independents):
     candidates = {}
     for expression in expressions:
-        jets = _dependent_jets(expression, dependents, independents, include_zeros=False)
+        jets = _dependent_jets(
+            expression, dependents, independents, include_zeros=False
+        )
         for (dependent_index, multi_index), derivative in jets.items():
             candidates[derivative] = (dependent_index, multi_index)
 
@@ -620,7 +622,9 @@ def differential_substitute(
     def find_replacements(current):
         replacements = {}
         candidates = set(current.atoms(sp.Derivative))
-        candidates.update(dependent for dependent in dependents if current.has(dependent))
+        candidates.update(
+            dependent for dependent in dependents if current.has(dependent)
+        )
         derivatives = sorted(
             candidates,
             key=lambda item: (
