@@ -80,6 +80,10 @@ def test_core_inputs_require_dependents_and_scalar_equations(independent_symbols
     with pytest.raises(TypeError, match="scalar Sympy expressions"):
         max_derivative_order(sp.Matrix([x, t]), sp.Function("u"), (x, t))
 
+    mismatched = sp.Function("mismatched")(x, t)
+    with pytest.raises(ValueError, match="exactly the declared independent"):
+        max_derivative_order(mismatched.diff(t), mismatched, x)
+
 
 # ==============================================================================
 # 2. Tests for total_derivative
@@ -188,6 +192,29 @@ def test_adjoint_frechet_derivative_kdv(
     assert res == expected
 
 
+def test_multifield_frechet_adjoint_identity_is_a_divergence(
+    independent_symbols, dependent_functions
+):
+    x, t = independent_symbols
+    u, v = dependent_functions
+    q = sp.Function("q")(x, t)
+    r = sp.Function("r")(x, t)
+    a = sp.Function("a")(x, t)
+    b = sp.Function("b")(x, t)
+    equations = (u.diff(t) + u * v.diff(x), v.diff(t) - u.diff(x) ** 2)
+
+    linearized = frechet_derivative(equations, (u, v), (x, t), (q, r))
+    adjoint = adjoint_frechet_derivative(equations, (u, v), (x, t), (a, b))
+    lagrange_identity = (
+        a * sum(linearized[0, column] for column in range(2))
+        + b * sum(linearized[1, column] for column in range(2))
+        - q * adjoint[0]
+        - r * adjoint[1]
+    )
+
+    assert euler_lagrange(lagrange_identity, (q, r, a, b), (x, t)) == (0, 0, 0, 0)
+
+
 # ==============================================================================
 # 5. Tests for euler_lagrange
 # ==============================================================================
@@ -283,6 +310,27 @@ def test_poisson_bracket_and_hamilton_equations():
         poisson_bracket(sp.Matrix([q_fn]), H, q_fn, p_fn)
 
 
+def test_multidimensional_poisson_bracket_satisfies_jacobi_identity():
+    q1, q2, p1, p2 = sp.symbols("q1 q2 p1 p2")
+    coordinates = (q1, q2)
+    momenta = (p1, p2)
+    f = q1 * p2 + q2**2
+    g = p1 * q2 + p2**2
+    h = q1**2 * p1 + q2 * p2
+
+    jacobi = sum(
+        poisson_bracket(
+            first,
+            poisson_bracket(second, third, coordinates, momenta),
+            coordinates,
+            momenta,
+        )
+        for first, second, third in ((f, g, h), (g, h, f), (h, f, g))
+    )
+
+    assert sp.expand(jacobi) == 0
+
+
 # ==============================================================================
 # 7. Tests for infer_substitution_rules & differential_substitute
 # ==============================================================================
@@ -332,6 +380,18 @@ def test_differential_substitution_iteration_boundary(
         differential_substitute(u.diff(t), rules, u, (x, t), max_iterations=0)
 
 
+def test_differential_substitution_counts_repeated_mixed_variables(
+    independent_symbols, dependent_functions
+):
+    x, t = independent_symbols
+    u, _ = dependent_functions
+    uncanonical = sp.Derivative(u, x, t, x, evaluate=False)
+    rules = {uncanonical: u}
+
+    assert differential_substitute(u.diff(x, t), rules, u, (x, t)) == u.diff(x, t)
+    assert differential_substitute(uncanonical, rules, u, (x, t)) == u
+
+
 def test_substitution_inference_reports_regular_parameter_branch(
     independent_symbols, dependent_functions
 ):
@@ -350,6 +410,71 @@ def test_substitution_inference_reports_regular_parameter_branch(
     assert conditions == (sp.Ne(a, 0),)
     determining = determining_equations(a * u.diff(t) - u.diff(x), u, (x, t))
     assert determining.regularity_conditions == conditions
+
+
+def test_implicit_and_algebraic_equation_branches_are_handled_explicitly():
+    x = sp.symbols("x")
+    u = sp.Function("u")(x)
+    scaling = InfinitesimalGenerator((0,), (u,))
+    implicit = u.diff(x) ** 2 - u**2
+
+    with pytest.raises(ValueError, match="explicit substitution_rules"):
+        infer_substitution_rules(implicit, u, x)
+    with pytest.raises(ValueError, match="explicit substitution_rules"):
+        verify_generator(implicit, u, x, scaling)
+
+    for branch in ({u.diff(x): u}, {u.diff(x): -u}):
+        assert verify_generator(implicit, u, x, scaling, substitution_rules=branch)
+        determining = determining_equations(implicit, u, x, substitution_rules=branch)
+        assert sp.Ne(u, 0) in determining.regularity_conditions
+
+    algebraic = u
+    assert infer_substitution_rules(algebraic, u, x) == {u: 0}
+    assert verify_generator(algebraic, u, x, scaling)
+
+
+def test_supplied_substitution_rules_are_certified_against_equations():
+    x = sp.symbols("x")
+    u = sp.Function("u")(x)
+    equation = u.diff(x)
+    generator = InfinitesimalGenerator((0,), (x * u,))
+
+    assert not verify_generator(
+        equation, u, x, generator, substitution_rules={u.diff(x): 0}
+    )
+    with pytest.raises(ValueError, match="do not reduce every supplied equation"):
+        verify_generator(
+            equation,
+            u,
+            x,
+            generator,
+            substitution_rules={u.diff(x): -u / x},
+        )
+
+    singular_equation = u.diff(x) ** 2
+    with pytest.raises(ValueError, match="regular solved branch"):
+        verify_generator(
+            singular_equation,
+            u,
+            x,
+            generator,
+            substitution_rules={u.diff(x): 0},
+        )
+
+    t = sp.symbols("t")
+    u_xt = sp.Function("u")(x, t)
+    differential_cycle = {u_xt.diff(t): u_xt.diff(x, t)}
+    with pytest.raises(ValueError, match="acyclic reduction"):
+        verify_generator(
+            u_xt.diff(t) - u_xt.diff(x, t),
+            u_xt,
+            (x, t),
+            InfinitesimalGenerator((0, 0), (u_xt,)),
+            substitution_rules=differential_cycle,
+        )
+    assert infer_substitution_rules(u_xt.diff(t) - u_xt.diff(x, t), u_xt, (x, t)) == {
+        u_xt.diff(x, t): u_xt.diff(t)
+    }
 
 
 # ==============================================================================
@@ -494,6 +619,67 @@ def test_lie_symmetries_odes():
     assert sol_scale.dimension == 4
     for gen in sol_scale.basis:
         assert verify_generator(scale_ode, y, t, gen)
+
+
+def test_polynomial_ansatz_supports_transcendental_equations():
+    x = sp.symbols("x")
+    u = sp.Function("u")(x)
+    pendulum = u.diff(x, 2) + sp.sin(u)
+
+    solution = infinitesimals(pendulum, u, x, ansatz_degree=0)
+
+    assert solution.ansatz_dimension == 1
+    assert solution.basis == (InfinitesimalGenerator((1,), (0,)),)
+    assert verify_generator(pendulum, u, x, solution.basis[0])
+
+
+def test_internal_symbols_do_not_collide_with_user_symbols():
+    U0 = sp.Symbol("U0")
+    u = sp.Function("u")(U0)
+
+    solution = infinitesimals(u.diff(U0), u, U0, ansatz_degree=1)
+    assert solution.ansatz_dimension > 0
+    assert all(verify_generator(u.diff(U0), u, U0, gen) for gen in solution.basis)
+
+    parameter = sp.Symbol("a1_0")
+    parameterized = u.diff(U0) - parameter * u
+    parameterized_solution = infinitesimals(parameterized, u, U0, ansatz_degree=1)
+    assert parameterized_solution.ansatz_dimension > 0
+
+    default_constant_name = sp.Symbol("k1")
+    colliding_constant = u.diff(U0) - default_constant_name * u
+    constant_solution = infinitesimals(colliding_constant, u, U0, ansatz_degree=1)
+    assert default_constant_name not in constant_solution.constants
+
+
+def test_regularity_conditions_use_original_jets_and_include_solver_pivots(
+    independent_symbols, dependent_functions
+):
+    x, t = independent_symbols
+    u, _ = dependent_functions
+    rational_equation = u.diff(t) - 1 / u.diff(x)
+
+    determining = determining_equations(rational_equation, u, (x, t))
+    solution = infinitesimals(rational_equation, u, (x, t), ansatz_degree=1)
+    for conditions in (
+        determining.regularity_conditions,
+        solution.regularity_conditions,
+    ):
+        assert sp.Ne(u.diff(x), 0) in conditions
+        assert not any(
+            isinstance(symbol, sp.Dummy)
+            for condition in conditions
+            for symbol in condition.free_symbols
+        )
+
+    c = sp.symbols("c")
+    wave = u.diff(t, 2) - c**2 * u.diff(x, 2)
+    generic = infinitesimals(wave, u, (x, t), ansatz_degree=1)
+    degenerate = infinitesimals(wave.subs(c, 0), u, (x, t), ansatz_degree=1)
+
+    assert any(condition.has(c) for condition in generic.regularity_conditions)
+    assert generic.ansatz_dimension == 8
+    assert degenerate.ansatz_dimension == 10
 
 
 # ==============================================================================

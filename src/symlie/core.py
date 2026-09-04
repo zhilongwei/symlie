@@ -54,6 +54,13 @@ def _normalize_dependents(
 
         if not isinstance(applied, AppliedUndef):
             raise TypeError("Dependent variable must be undefined Sympy functions.")
+        if len(applied.args) != len(independents) or set(applied.args) != set(
+            independents
+        ):
+            raise ValueError(
+                f"Dependent variable '{applied}' must be a function of exactly the "
+                "declared independent variables."
+            )
         dependents.append(applied)
 
     _ensure_unique(dependents, "Dependent variables")
@@ -95,7 +102,9 @@ def _multi_index(jet, dependent, independents) -> tuple[int, ...] | None:
     if not isinstance(jet, sp.Derivative) or jet.expr != dependent:
         return None
 
-    counts = dict(jet.variable_count)
+    counts = {}
+    for variable, count in jet.variable_count:
+        counts[variable] = counts.get(variable, 0) + int(count)
     if any(variable not in independents for variable in counts):
         return None
 
@@ -411,9 +420,7 @@ def _normalize_canonical_variables(coordinates, momenta, *, time=None):
 def _ordered_derivative_candidates(expressions, dependents, independents):
     candidates = {}
     for expression in expressions:
-        jets = _dependent_jets(
-            expression, dependents, independents, include_zeros=False
-        )
+        jets = _dependent_jets(expression, dependents, independents)
         for (dependent_index, multi_index), derivative in jets.items():
             candidates[derivative] = (dependent_index, multi_index)
 
@@ -437,14 +444,64 @@ def _ordered_derivative_candidates(expressions, dependents, independents):
 
 def _append_condition(conditions, expression):
     expression = sp.factor(sp.simplify(expression))
-    if expression.is_nonzero is True:
-        return
-    condition = sp.Ne(expression, 0, evaluate=False)
-    if condition not in conditions:
-        conditions.append(condition)
+    numerator, denominator = sp.together(expression).as_numer_denom()
+
+    def append_factor(factor):
+        factor = sp.factor(factor)
+        if factor.is_Mul:
+            for item in factor.args:
+                append_factor(item)
+            return
+        if factor.is_Pow and factor.exp.is_number and factor.exp != 0:
+            factor = factor.base
+        if factor.is_nonzero is True:
+            return
+        if factor.is_zero is True:
+            raise ValueError("Encountered an impossible regularity condition.")
+        condition = sp.Ne(factor, 0, evaluate=False)
+        if condition not in conditions:
+            conditions.append(condition)
+
+    append_factor(numerator)
+    if denominator != 1:
+        append_factor(denominator)
 
 
-def _solve_substitution_system(expressions, leaders):
+def _rule_multi_index(leading_jet, dependents, independents):
+    for index, dependent in enumerate(dependents):
+        multi_index = _multi_index(leading_jet, dependent, independents)
+        if multi_index is not None:
+            return index, multi_index
+    return None
+
+
+def _rules_are_acyclic(rules, dependents, independents):
+    parsed_leaders = []
+    for leader in rules:
+        parsed = _rule_multi_index(leader, dependents, independents)
+        if parsed is None:
+            return False
+        parsed_leaders.append(parsed)
+
+    for right_hand_side in rules.values():
+        for dependent_index, multi_index in _dependent_jets(
+            right_hand_side, dependents, independents
+        ):
+            if any(
+                dependent_index == leader_dependent
+                and all(
+                    target_order >= leader_order
+                    for target_order, leader_order in zip(
+                        multi_index, leader_multi_index
+                    )
+                )
+                for leader_dependent, leader_multi_index in parsed_leaders
+            ):
+                return False
+    return True
+
+
+def _solve_substitution_system(expressions, leaders, dependents, independents):
     try:
         solutions = sp.solve(
             expressions,
@@ -461,7 +518,7 @@ def _solve_substitution_system(expressions, leaders):
     # solve(..., simplify=True) already simplifies each solution; re-simplifying
     # here would just repeat that work.
     rules = {leader: solutions[0][leader] for leader in leaders}
-    if any(right_hand_side.has(*leaders) for right_hand_side in rules.values()):
+    if not _rules_are_acyclic(rules, dependents, independents):
         return None
     if any(sp.simplify(expression.xreplace(rules)) != 0 for expression in expressions):
         return None
@@ -504,17 +561,19 @@ def _infer_substitution_rules_core(
     if leading_derivatives is not None:
         leaders = _as_tuple(leading_derivatives)
         if not leaders or not _is_unique(leaders):
-            raise ValueError("Leading derivatives must be non-empty and unique.")
+            raise ValueError("Leading jets must be non-empty and unique.")
         if any(leader not in candidates for leader in leaders):
             raise ValueError(
-                "Every leading derivative must occur in the equations as a derivative "
-                "of a dependent variable."
+                "Every leading jet must occur in the equations as a dependent-variable "
+                "jet."
             )
-        solved = _solve_substitution_system(expressions, leaders)
+        solved = _solve_substitution_system(
+            expressions, leaders, dependents, independents
+        )
         if solved is None:
             raise ValueError(
                 "The equations do not define a unique regular, acyclic reduction "
-                "for the requested leading derivatives."
+                "for the requested leading jets."
             )
         return solved
 
@@ -523,7 +582,9 @@ def _infer_substitution_rules_core(
     trial_count = 0
     for leader_count in range(maximum_leaders, 0, -1):
         for leaders in combinations(candidates, leader_count):
-            solved = _solve_substitution_system(expressions, leaders)
+            solved = _solve_substitution_system(
+                expressions, leaders, dependents, independents
+            )
             trial_count += 1
             if solved is not None or trial_count >= 64:
                 break
@@ -535,7 +596,14 @@ def _infer_substitution_rules_core(
             "leading_derivatives explicitly."
         )
     if solved is None:
-        solved = ({}, ())
+        if all(expression == 0 for expression in expressions):
+            solved = ({}, ())
+        else:
+            raise ValueError(
+                "Automatic leader selection could not construct a unique regular "
+                "reduction; provide explicit substitution_rules for one equation "
+                "branch."
+            )
     return solved
 
 
@@ -546,13 +614,11 @@ def infer_substitution_rules(
     *,
     leading_derivatives=None,
     return_conditions: bool = False,
-) -> (
-    dict[sp.Derivative, sp.Expr]
-    | tuple[dict[sp.Derivative, sp.Expr], tuple[sp.Basic, ...]]
-):
+) -> dict[sp.Basic, sp.Expr] | tuple[dict[sp.Basic, sp.Expr], tuple[sp.Basic, ...]]:
     """Infer an orthonomic differential reduction on a regular equation branch.
 
-    Equations are solved simultaneously for distinct leading derivatives.  When
+    Equations are solved simultaneously for distinct leading jets (including
+    zero-order dependent variables).  When
     ``leading_derivatives`` is omitted, a deterministic ranking prefers pure
     derivatives in the last independent variable, which conventionally serves
     as the evolution variable.  The inferred identities are valid only where
@@ -561,6 +627,7 @@ def infer_substitution_rules(
     Set ``return_conditions=True`` to receive ``(rules, conditions)``.  If the
     automatic ranking is unsuitable, provide explicit leading derivatives or
     pass explicit substitution rules to the downstream symmetry functions.
+    A ``ValueError`` is raised when no unique regular branch can be inferred.
     """
     independents = _normalize_independents(independent_variables)
     dependents = _normalize_dependents(dependent_variables, independent_variables)
@@ -571,24 +638,19 @@ def infer_substitution_rules(
     return solved if return_conditions else solved[0]
 
 
-def _rule_multi_index(leading_derivative, dependents, independents):
-    for index, dependent in enumerate(dependents):
-        multi_index = _multi_index(leading_derivative, dependent, independents)
-        if multi_index is not None:
-            return index, multi_index
-    return None
-
-
 def differential_substitute(
     expression,
-    substitution_rules: Mapping[sp.Derivative, sp.Expr],
+    substitution_rules: Mapping[sp.Basic, sp.Expr],
     dependent_variables,
     independent_variables,
     *,
     max_iterations: int = 16,
 ):
+    """Reduce an expression using solved jet rules and their consequences."""
     independents = _normalize_independents(independent_variables)
     dependents = _normalize_dependents(dependent_variables, independent_variables)
+    if not isinstance(substitution_rules, Mapping):
+        raise TypeError("substitution_rules must be a mapping.")
     if (
         not isinstance(max_iterations, int)
         or isinstance(max_iterations, bool)
@@ -601,7 +663,7 @@ def differential_substitute(
         parsed = _rule_multi_index(leading, dependents, independents)
         if parsed is None:
             raise ValueError(
-                f"Leading derivative {leading} is not a valid dependent variable derivative."
+                f"Leading jet {leading} is not a valid dependent-variable jet."
             )
         parsed_rules.append(
             (parsed[0], parsed[1], leading, sp.simplify(right_hand_side))
@@ -682,6 +744,76 @@ def differential_substitute(
     )
 
 
+def _validate_substitution_rules(expressions, rules, dependents, independents):
+    """Normalize and certify user-supplied rules against an equation system."""
+    if not isinstance(rules, Mapping):
+        raise TypeError("substitution_rules must be a mapping.")
+
+    normalized = {}
+    for leading, right_hand_side in rules.items():
+        parsed = _rule_multi_index(leading, dependents, independents)
+        if parsed is None:
+            raise ValueError(
+                f"Leading jet {leading} is not a valid dependent-variable jet."
+            )
+        normalized_leading = _derivative_from_multi_index(
+            dependents[parsed[0]], parsed[1], independents
+        )
+        if normalized_leading in normalized:
+            raise ValueError("substitution_rules must have unique leading jets.")
+        normalized[normalized_leading] = sp.simplify(right_hand_side)
+
+    leaders = tuple(normalized)
+    if not leaders:
+        if all(expression == 0 for expression in expressions):
+            return normalized, ()
+        raise ValueError(
+            "substitution_rules cannot be empty for a nontrivial equation system."
+        )
+    if not _rules_are_acyclic(normalized, dependents, independents):
+        raise ValueError("substitution_rules must define an acyclic reduction.")
+
+    for expression in expressions:
+        reduced = differential_substitute(
+            expression,
+            normalized,
+            dependents,
+            independents,
+        )
+        if sp.simplify(reduced) != 0:
+            raise ValueError(
+                "substitution_rules do not reduce every supplied equation to zero."
+            )
+
+    conditions = []
+    for right_hand_side in normalized.values():
+        denominator = sp.denom(sp.together(right_hand_side))
+        if denominator != 1:
+            _append_condition(conditions, denominator)
+
+    jacobian = sp.Matrix(expressions).jacobian(leaders)
+    regular = False
+    for row_indices in combinations(range(len(expressions)), len(leaders)):
+        minor = jacobian[list(row_indices), :]
+        regularity_factor = differential_substitute(
+            minor.det(),
+            normalized,
+            dependents,
+            independents,
+        )
+        regularity_factor = sp.simplify(regularity_factor)
+        if regularity_factor != 0:
+            _append_condition(conditions, regularity_factor)
+            regular = True
+            break
+    if not regular:
+        raise ValueError(
+            "substitution_rules do not define a regular solved branch of the equations."
+        )
+
+    return normalized, tuple(conditions)
+
+
 def prolongation(
     equations,
     dependent_variables,
@@ -689,13 +821,15 @@ def prolongation(
     xi,
     phi,
     *,
-    substitution_rules: Mapping[sp.Derivative, sp.Expr] | None = None,
+    substitution_rules: Mapping[sp.Basic, sp.Expr] | None = None,
 ) -> tuple[sp.Expr, ...]:
     """Prolong a point vector field and apply it to differential equations.
 
     ``xi`` contains the infinitesimals of the independent variables and
     ``phi`` those of the dependent variables.  Returned expressions are the
     invariance residuals ``pr X(F)`` restricted to the equation manifold.
+    Supplied substitution rules are accepted only when they reduce every
+    equation to zero and define a regular solved branch.
     """
 
     independents = _normalize_independents(independent_variables)
@@ -730,6 +864,10 @@ def prolongation(
     if substitution_rules is None:
         substitution_rules = _infer_substitution_rules_core(
             expressions, dependents, independents
+        )[0]
+    else:
+        substitution_rules = _validate_substitution_rules(
+            expressions, substitution_rules, dependents, independents
         )[0]
     if substitution_rules:
         residuals = [
@@ -766,24 +904,51 @@ def _append_unique(expressions, candidate, conditions=None):
     expressions.append(candidate)
 
 
-def _jet_replacement_map(expression, dependents, independents):
+def _jet_replacement_map(
+    expression, dependents, independents, *, dependent_symbols=None
+):
     jets = _dependent_jets(expression, dependents, independents, include_zeros=False)
     ordered_jets = sorted(jets.values(), key=sp.default_sort_key)
-    jet_symbols = sp.symbols(f"J0:{len(ordered_jets)}")
-    dependent_symbols = sp.symbols(f"U0:{len(dependents)}")
+    jet_symbols = tuple(sp.Dummy(f"J{index}") for index in range(len(ordered_jets)))
+    if dependent_symbols is None:
+        dependent_symbols = tuple(
+            sp.Dummy(f"U{index}") for index in range(len(dependents))
+        )
+    else:
+        dependent_symbols = tuple(dependent_symbols)
+        if len(dependent_symbols) != len(dependents):
+            raise ValueError("dependent_symbols dimensions do not match dependents.")
     mapping = dict(zip(ordered_jets, jet_symbols))
     mapping.update(zip(dependents, dependent_symbols))
-    return mapping, tuple(jet_symbols), tuple(dependent_symbols)
+    return mapping, jet_symbols, dependent_symbols
 
 
-def _split_on_jets(expression, dependents, independents, conditions=None):
+def _restore_replaced_expression(expression, mapping):
+    return expression.xreplace(
+        {replacement: original for original, replacement in mapping.items()}
+    )
+
+
+def _split_on_jets(
+    expression,
+    dependents,
+    independents,
+    conditions=None,
+    *,
+    dependent_symbols=None,
+):
     mapping, jet_symbols, dependent_symbols = _jet_replacement_map(
-        expression, dependents, independents
+        expression,
+        dependents,
+        independents,
+        dependent_symbols=dependent_symbols,
     )
     algebraic = sp.expand(expression.xreplace(mapping))
     numerator, denominator = sp.together(algebraic).as_numer_denom()
     if conditions is not None and denominator != 1:
-        _append_condition(conditions, denominator)
+        _append_condition(
+            conditions, _restore_replaced_expression(denominator, mapping)
+        )
     if not jet_symbols:
         return [_normalize_zero_expression(numerator, conditions)], dependent_symbols
     try:
@@ -826,7 +991,7 @@ class DeterminingSystem:
     residuals: tuple[sp.Expr, ...]
     xi: tuple[sp.Expr, ...]
     phi: tuple[sp.Expr, ...]
-    substitution_rules: Mapping[sp.Derivative, sp.Expr]
+    substitution_rules: Mapping[sp.Basic, sp.Expr]
     dependent_symbols: tuple[sp.Symbol, ...]
     regularity_conditions: tuple[sp.Basic, ...] = ()
 
@@ -858,7 +1023,7 @@ def determining_equations(
     dependent_variables,
     independent_variables,
     *,
-    substitution_rules: Mapping[sp.Derivative, sp.Expr] | None = None,
+    substitution_rules: Mapping[sp.Basic, sp.Expr] | None = None,
 ) -> DeterminingSystem:
     """Construct the point-symmetry determining equations.
 
@@ -883,6 +1048,11 @@ def determining_equations(
             expressions, dependents, independents
         )
         conditions.extend(inferred_conditions)
+    else:
+        substitution_rules, supplied_conditions = _validate_substitution_rules(
+            expressions, substitution_rules, dependents, independents
+        )
+        conditions.extend(supplied_conditions)
     residuals = prolongation(
         expressions,
         dependents,
@@ -892,12 +1062,15 @@ def determining_equations(
         substitution_rules=substitution_rules,
     )
     coefficients = []
-    dependent_symbols = tuple(sp.symbols(f"U0:{len(dependents)}"))
+    dependent_symbols = tuple(sp.Dummy(f"U{index}") for index in range(len(dependents)))
     for residual in residuals:
-        split, current_dependent_symbols = _split_on_jets(
-            residual, dependents, independents, conditions
+        split, _ = _split_on_jets(
+            residual,
+            dependents,
+            independents,
+            conditions,
+            dependent_symbols=dependent_symbols,
         )
-        dependent_symbols = current_dependent_symbols
         for coefficient in split:
             _append_unique(coefficients, coefficient, conditions)
     return DeterminingSystem(
@@ -926,12 +1099,103 @@ def _monomials(variables, degree):
     )
 
 
-def _normalize_null_vector(vector):
+def _normalize_null_vector(vector, conditions=None):
     vector = tuple(sp.simplify(value) for value in vector)
     first = next((value for value in vector if value != 0), None)
     if first is None:
         return vector
-    return tuple(sp.simplify(value / first) for value in vector)
+    normalized = tuple(sp.simplify(value / first) for value in vector)
+    if conditions is not None:
+        for value in normalized:
+            denominator = sp.denom(sp.together(value))
+            if denominator != 1:
+                _append_condition(conditions, denominator)
+    return normalized
+
+
+def _nullspace_on_regular_parameter_branch(matrix, conditions):
+    reduced, pivot_columns = matrix.rref()
+    pivot_columns = tuple(pivot_columns)
+
+    if pivot_columns:
+        pivot_block = matrix[:, list(pivot_columns)]
+        _, pivot_rows = pivot_block.T.rref()
+        pivot_rows = tuple(pivot_rows)
+        if len(pivot_rows) != len(pivot_columns):
+            raise ValueError("Could not certify the generic determining-system rank.")
+        rank_minor = matrix.extract(pivot_rows, pivot_columns).det()
+        _append_condition(conditions, rank_minor)
+
+    free_columns = tuple(
+        column for column in range(matrix.cols) if column not in pivot_columns
+    )
+    vectors = []
+    for free_column in free_columns:
+        vector = [sp.S.Zero] * matrix.cols
+        vector[free_column] = sp.S.One
+        for row, pivot_column in enumerate(pivot_columns):
+            vector[pivot_column] = -reduced[row, free_column]
+        vectors.append(_normalize_null_vector(vector, conditions))
+    return tuple(vectors)
+
+
+def _nonpolynomial_replacements(expression, generators):
+    candidates = set(expression.atoms(sp.Function, sp.Derivative))
+    for power in expression.atoms(sp.Pow):
+        if power.exp.is_integer is True and power.exp.is_nonnegative is True:
+            continue
+        if power.has(*generators):
+            candidates.add(power)
+
+    candidates = {candidate for candidate in candidates if candidate.has(*generators)}
+    ordered = sorted(candidates, key=sp.default_sort_key)
+    replacements = {
+        candidate: sp.Dummy(f"N{index}") for index, candidate in enumerate(ordered)
+    }
+    return replacements
+
+
+def _identity_coefficients(expression, generators):
+    expression = sp.expand(expression)
+    try:
+        polynomial = sp.Poly(expression, *generators)
+    except sp.PolynomialError as original_error:
+        replacements = _nonpolynomial_replacements(expression, generators)
+        if not replacements:
+            raise ValueError(
+                "the polynomial infinitesimal ansatz produced an unsupported "
+                "non-polynomial invariance condition"
+            ) from original_error
+        auxiliary = tuple(replacements.values())
+        try:
+            polynomial = sp.Poly(
+                sp.expand(expression.xreplace(replacements)),
+                *generators,
+                *auxiliary,
+            )
+        except sp.PolynomialError as error:
+            raise ValueError(
+                "the polynomial infinitesimal ansatz produced an unsupported "
+                "non-polynomial invariance condition"
+            ) from error
+    return tuple(coefficient for _, coefficient in polynomial.terms())
+
+
+def _fresh_constant_symbols(prefix, count, expressions):
+    reserved_names = {
+        symbol.name
+        for expression in expressions
+        for symbol in expression.free_symbols
+        if isinstance(symbol, sp.Symbol)
+    }
+    constants = []
+    for index in range(1, count + 1):
+        name = f"{prefix}{index}"
+        while name in reserved_names:
+            name += "_"
+        constants.append(sp.Symbol(name))
+        reserved_names.add(name)
+    return tuple(constants)
 
 
 def infinitesimals(
@@ -940,7 +1204,7 @@ def infinitesimals(
     independent_variables,
     *,
     ansatz_degree: int = 1,
-    substitution_rules: Mapping[sp.Derivative, sp.Expr] | None = None,
+    substitution_rules: Mapping[sp.Basic, sp.Expr] | None = None,
     constant_prefix: str = "k",
 ) -> InfinitesimalSolution:
     """Find polynomial point infinitesimals by exact linear algebra.
@@ -955,6 +1219,13 @@ def infinitesimals(
     complete point-symmetry algebra.  In particular, linear equations have an
     infinite solution-superposition ideal.  For degrees above one, the finite
     ansatz space is also not automatically closed under Lie brackets.
+
+    Common non-polynomial factors in the equations are treated as additional
+    algebraically independent generators when the determining identity is
+    split.  Simplify any identities between such factors before calling this
+    function.  Parameter conditions required by the generic nullspace basis
+    are returned in ``regularity_conditions``; exceptional values must be
+    solved separately.
     """
 
     independents = _normalize_independents(independent_variables)
@@ -966,16 +1237,24 @@ def infinitesimals(
             expressions, dependents, independents
         )
         conditions.extend(inferred_conditions)
+    else:
+        substitution_rules, supplied_conditions = _validate_substitution_rules(
+            expressions, substitution_rules, dependents, independents
+        )
+        conditions.extend(supplied_conditions)
 
-    dependent_symbols = tuple(sp.symbols(f"U0:{len(dependents)}"))
+    dependent_symbols = tuple(sp.Dummy(f"U{index}") for index in range(len(dependents)))
     algebraic_variables = independents + dependent_symbols
     monomials = _monomials(algebraic_variables, ansatz_degree)
     coefficient_groups = []
     ansatz_components = []
     component_count = len(independents) + len(dependents)
     for component_index in range(component_count):
-        coefficients = sp.symbols(f"a{component_index + 1}_0:{len(monomials)}")
-        coefficient_groups.append(tuple(coefficients))
+        coefficients = tuple(
+            sp.Dummy(f"a{component_index + 1}_{index}")
+            for index in range(len(monomials))
+        )
+        coefficient_groups.append(coefficients)
         polynomial = sum(
             coefficient * monomial
             for coefficient, monomial in zip(coefficients, monomials)
@@ -996,22 +1275,20 @@ def infinitesimals(
 
     determining = []
     for residual in residuals:
-        mapping, jet_symbols, current_dependent_symbols = _jet_replacement_map(
-            residual, dependents, independents
+        mapping, jet_symbols, _ = _jet_replacement_map(
+            residual,
+            dependents,
+            independents,
+            dependent_symbols=dependent_symbols,
         )
         algebraic = sp.expand(residual.xreplace(mapping))
         numerator, denominator = sp.together(algebraic).as_numer_denom()
         if denominator != 1:
-            _append_condition(conditions, denominator)
-        generators = independents + current_dependent_symbols + jet_symbols
-        try:
-            polynomial = sp.Poly(sp.expand(numerator), *generators)
-        except sp.PolynomialError as error:
-            raise ValueError(
-                "the polynomial infinitesimal ansatz produced a non-polynomial "
-                "invariance condition"
-            ) from error
-        for _, coefficient in polynomial.terms():
+            _append_condition(
+                conditions, _restore_replaced_expression(denominator, mapping)
+            )
+        generators = independents + dependent_symbols + jet_symbols
+        for coefficient in _identity_coefficients(numerator, generators):
             _append_unique(determining, coefficient, conditions)
 
     all_coefficients = tuple(
@@ -1021,7 +1298,7 @@ def infinitesimals(
         matrix, right_hand_side = sp.linear_eq_to_matrix(determining, all_coefficients)
         if any(value != 0 for value in right_hand_side):
             raise ValueError("the determining system unexpectedly became inhomogeneous")
-        vectors = tuple(_normalize_null_vector(vector) for vector in matrix.nullspace())
+        vectors = _nullspace_on_regular_parameter_branch(matrix, conditions)
     else:
         vectors = tuple(
             tuple(
@@ -1040,7 +1317,7 @@ def infinitesimals(
                 tuple(sp.simplify(value.subs(substitutions)) for value in phi),
             )
         )
-    constants = tuple(sp.symbols(f"{constant_prefix}1:{len(basis) + 1}"))
+    constants = _fresh_constant_symbols(constant_prefix, len(basis), expressions)
     general = InfinitesimalGenerator(
         tuple(
             sp.expand(
@@ -1077,13 +1354,15 @@ def verify_generator(
     independent_variables,
     generator: InfinitesimalGenerator,
     *,
-    substitution_rules: Mapping[sp.Derivative, sp.Expr] | None = None,
+    substitution_rules: Mapping[sp.Basic, sp.Expr] | None = None,
 ) -> bool:
     """Return whether a generator is invariant on the selected regular branch.
 
     Automatically inferred substitution rules can require nonzero regularity
     conditions.  Use :func:`infer_substitution_rules` with
     ``return_conditions=True`` when those conditions need to be inspected.
+    If no regular equation branch can be inferred, or supplied rules do not
+    define one, a ``ValueError`` is raised rather than returning a false result.
     """
 
     residuals = prolongation(

@@ -181,12 +181,25 @@ equations also possess the infinite solution-superposition ideal
 $h(x)\partial_u$, where $h$ is any solution of the homogeneous equation.
 
 Automatic differential substitution solves the equations simultaneously for
-distinct leading derivatives and reports any nonzero regularity conditions.
+distinct leading jets and reports any nonzero regularity conditions.
 Use `infer_substitution_rules` with `leading_derivatives=...` and
 `return_conditions=True` when the automatic derivative ranking is unsuitable,
 or pass explicit `substitution_rules` to the symmetry routines. Exceptional
 parameter values should be substituted before analysis because they can define
-different equation branches and symmetry algebras.
+different equation branches and symmetry algebras. If no unique regular branch
+can be inferred, the symmetry routines raise `ValueError` instead of evaluating
+the invariance condition off the equation manifold. Explicit substitution rules
+are checked against the equations and must define a regular solved branch.
+
+The polynomial solver constrains the infinitesimal coefficients to a finite
+polynomial ansatz; the differential equation itself may contain common
+transcendental factors such as exponentials and trigonometric functions. After
+symbolic simplification, distinct non-polynomial factors are split as additional
+algebraically independent generators. Simplify or rewrite identities between
+those factors before solving. Returned regularity conditions include both
+equation reduction assumptions and parameter conditions needed by the generic
+nullspace basis. Substitute exceptional parameter values and solve again to
+obtain their separate symmetry branches.
 
 ---
 
@@ -213,4 +226,3 @@ The theoretical foundation and design of `symlie` draw upon the following classi
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
